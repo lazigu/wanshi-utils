@@ -1,6 +1,7 @@
 import logging
 from collections import namedtuple
 from typing import List, Mapping, Optional, Sequence, Tuple
+from cmcrameri import cm
 
 import numpy as np
 import numpy.typing as npt
@@ -10,6 +11,7 @@ from matplotlib import pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Colormap
 from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import precision_recall_curve, average_precision_score
 from tqdm import trange
 
 all = [
@@ -18,11 +20,133 @@ all = [
     "plot_rocs_for_subtypes",
 ]
 
+def plot_multiple_decorated_pr_curves(
+    ax: plt.Axes,
+    y_trues: Sequence[npt.NDArray[np.bool_]],
+    y_scores: Sequence[npt.NDArray[np.float64]],
+    class_labels: Sequence[str] = None,
+    *,
+    title: Optional[str] = None,
+    n_bootstrap_samples: Optional[int] = None,
+):
+    """Plots a family of PR curves for multiple classes.
+
+    Args:
+        ax:  Axis to plot to.
+        y_trues:  Sequence of ground truth lists.
+        y_scores:  Sequence of prediction lists.
+        class_labels:  Sequence of class labels.
+        title:  Title of the plot.
+    """
+
+    if class_labels:
+        tpas = [TPAL(t, p, average_precision_score(t, p), label) for t, p, label in zip(y_trues, y_scores, class_labels)]
+        _ = [print(f'Class {label}: AP = {average_precision_score(t, p)}') for t, p, label in zip(y_trues, y_scores, class_labels)]
+    else:
+        tpas = [TPA(t, p, average_precision_score(t, p)) for t, p in zip(y_trues, y_scores)]
+        _ = [print(f'Fold {i+1}: AP = {average_precision_score(t, p)}') for i, (t, p) in enumerate(zip(y_trues, y_scores))]
+
+    tpas = sorted(tpas, key=lambda x: x.auc, reverse=True)
+    color_pool = np.linspace(0.4, 0.8, len(tpas))
+
+    if class_labels:
+        for i, (t, p, ap, label) in enumerate(tpas):
+            color_index = color_pool[i]
+            ap, _ = plot_bootstrapped_pr_curve(
+                ax, t, p, label=f"{label}: AP = {{ci}}", n_bootstrap_samples=n_bootstrap_samples, color_index=color_index
+            )
+    else:
+        for i, (t, p, ap) in enumerate(tpas):
+            color_index = color_pool[i]
+            ap, _ = plot_bootstrapped_pr_curve(
+                ax, t, p, label=f"Fold {i+1}: AP = {{ci}}", n_bootstrap_samples=n_bootstrap_samples, color_index=color_index
+            )
+
+    style_pr(ax)
+
+    aps = [x.auc for x in tpas]
+    l, h = st.t.interval(0.95, len(aps) - 1, loc=np.mean(aps), scale=st.sem(aps))
+    conf_range = (h - l) / 2
+    print(f"Title: {title}")
+    if title:
+        ax.set_title(f"{title}")
+    else:
+        ax.set_title(pr_str(np.mean(aps), conf_range))
+
+
+def style_pr(ax: plt.Axes) -> None:
+    """Style function for PR curves to ensure consistency."""
+    #ax.plot([0, 1], [1, 0], "gray", linestyle="--")
+    ax.set_aspect("equal")
+    #ax.set_xlim([0, 1])
+    #ax.set_ylim([0, 1])
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.legend(loc="lower right", prop={'size': 8})
+
+
+def plot_bootstrapped_pr_curve(
+    ax: plt.Axes,
+    y_true: npt.NDArray[np.bool_],
+    y_score: npt.NDArray[np.float64],
+    label: Optional[str],
+    n_bootstrap_samples: Optional[int] = None,
+    color_index: Optional[int] = 0.7,
+):
+    """Plots a precision-recall curve with a bootstrap interval.
+
+    Args:
+        ax:  The axes to plot onto.
+        y_true:  The ground truths.
+        y_score:  The predictions corresponding to the ground truths.
+        label:  A label to attach to the curve. The string `{ci}` will be replaced with the AUC
+            and the range of the confidence interval.
+    """
+    assert len(y_true) == len(y_score), "Length of truths and scores does not match."
+    conf_range = None
+
+    #colormap = cm.devon_r   # blue
+    colormap=cm.acton_r   # pink
+    color = colormap(color_index)
+
+    if n_bootstrap_samples:
+        fill = False
+        rng = np.random.default_rng()
+        interp_prs = []
+        bootstrap_aps = []
+        precision_ref = np.linspace(0, 1, num=1000)
+        for _ in trange(n_bootstrap_samples, desc="Bootstrapping PR curves", leave=False):
+            sample_idxs = rng.choice(len(y_true), len(y_true))
+            sample_y_true = y_true[sample_idxs]
+            sample_y_score = y_score[sample_idxs]
+            if len(np.unique(sample_y_true)) != 2:
+                continue
+            precision, recall, _ = precision_recall_curve(sample_y_true, sample_y_score)
+            interp_prs.append(np.interp(precision_ref, recall[::-1], precision[::-1]))  # reverse recall and precision for interpolation
+            bootstrap_aps.append(average_precision_score(sample_y_true, sample_y_score))
+
+        lower = np.percentile(interp_prs, 2.5, axis=0)
+        upper = np.percentile(interp_prs, 97.5, axis=0)
+        ax.fill_between(precision_ref, lower, upper, color=color, alpha=0.2)
+
+        conf_range = (np.percentile(bootstrap_aps, 97.5) - np.percentile(bootstrap_aps, 2.5)) / 2
+    else:
+        fill = True
+
+    precision, recall, _ = precision_recall_curve(y_true, y_score)
+    ap = average_precision_score(y_true, y_score)
+    ci_str = f"${ap:0.2f} \pm {conf_range:0.2f}$" if conf_range else f"${ap:0.2f}$"
+    print(f"Conf range: {conf_range}")
+    ax.plot(recall, precision, label=label.format(ci=ci_str) if label else "", color=color)
+    if fill:
+        ax.fill_between(recall, precision, color=color, alpha=0.05)
+
+    return ap, conf_range
 
 def plot_single_decorated_roc_curve(
     ax: plt.Axes,
     y_true: npt.NDArray[np.bool_],
-    y_pred: npt.NDArray[np.float_],
+    y_pred: npt.NDArray[np.float64],
     *,
     title: Optional[str] = None,
     n_bootstrap_samples: Optional[int] = None,
@@ -46,7 +170,8 @@ def plot_single_decorated_roc_curve(
     )
     style_auc(ax)
     if title:
-        ax.set_title(title)
+        #ax.set_title(title)
+        ax.set_title(f"{title.split('(')[0]} = {title.split('=')[-1]}")
 
 
 def auc_str(auc: float, conf_range: Optional[float]) -> str:
@@ -55,22 +180,32 @@ def auc_str(auc: float, conf_range: Optional[float]) -> str:
     else:
         return f"AUC = ${auc:0.2f}$"
 
+def pr_str(auc: float, conf_range: Optional[float]) -> str:
+    if conf_range:
+        return f"AP = ${auc:0.2f} \pm {conf_range:0.2f}$"
+    else:
+        return f"AP = ${auc:0.2f}$"
+
 
 def style_auc(ax: plt.Axes) -> None:
-    ax.plot([0, 1], [0, 1], "r--")
+    ax.plot([0, 1], [0, 1], "gray", linestyle="--")
     ax.set_aspect("equal")
+    #ax.set_xlim([0, 1])
+    #ax.set_ylim([0, 1])
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
-    ax.legend(loc="lower right")
+    ax.legend(loc="lower right", prop={'size': 8})
 
 
+TPAL = namedtuple("TPA", ["true", "pred", "auc", "label"])
 TPA = namedtuple("TPA", ["true", "pred", "auc"])
 
 
 def plot_multiple_decorated_roc_curves(
     ax: plt.Axes,
     y_trues: Sequence[npt.NDArray[np.bool_]],
-    y_scores: Sequence[npt.NDArray[np.float_]],
+    y_scores: Sequence[npt.NDArray[np.float64]],
+    class_labels: Sequence[str] = None,
     *,
     title: Optional[str] = None,
     n_bootstrap_samples: Optional[int] = None,
@@ -84,14 +219,31 @@ def plot_multiple_decorated_roc_curves(
         title:  Title of the plot.
     """
     # sort trues, preds, AUCs by AUC
-    tpas = [TPA(t, p, roc_auc_score(t, p)) for t, p in zip(y_trues, y_scores)]
+    if class_labels:
+        tpas = [TPAL(t, p, roc_auc_score(t, p), label) for t, p, label in zip(y_trues, y_scores, class_labels)]
+        #_ = [print(f'Fold {i}: AUC = {roc_auc_score(t, p)}') for i, (t, p) in enumerate(zip(y_trues, y_scores))] 
+        _ = [print(f'Class {label}: AUC = {roc_auc_score(t, p)}') for t, p, label in zip(y_trues, y_scores, class_labels)]
+    else:
+        tpas = [TPA(t, p, roc_auc_score(t, p)) for t, p in zip(y_trues, y_scores)]
+        _ = [print(f'Fold {i}: AUC = {roc_auc_score(t, p)}') for i, (t, p) in enumerate(zip(y_trues, y_scores))]
+
     tpas = sorted(tpas, key=lambda x: x.auc, reverse=True)
+    color_pool = np.linspace(0.4, 0.8, len(tpas))
 
     # plot rocs
-    for t, p, auc in tpas:
-        auc, _ = plot_bootstrapped_roc_curve(
-            ax, t, p, label="AUC = {ci}", n_bootstrap_samples=n_bootstrap_samples
-        )
+    if class_labels:
+        for i, (t, p, auc, label) in enumerate(tpas):
+            color_index = color_pool[i]
+            #class_label = class_labels[i]
+            auc, _ = plot_bootstrapped_roc_curve(
+                ax, t, p, label=f"{label}: AUC = {{ci}}", n_bootstrap_samples=n_bootstrap_samples, color_index=color_index
+            )
+    else:
+        for i, (t, p, auc) in enumerate(tpas):
+            color_index = color_pool[i]
+            auc, _ = plot_bootstrapped_roc_curve(
+                ax, t, p, label=f"Fold {i}: AUC = {{ci}}", n_bootstrap_samples=n_bootstrap_samples, color_index=color_index
+            )
 
     # style plot
     style_auc(ax)
@@ -100,9 +252,10 @@ def plot_multiple_decorated_roc_curves(
     aucs = [x.auc for x in tpas]
     l, h = st.t.interval(0.95, len(aucs) - 1, loc=np.mean(aucs), scale=st.sem(aucs))
     conf_range = (h - l) / 2
-
+    print(f"Title: {title}")
     if title:
-        ax.set_title(f"{title}\n({auc_str(np.mean(aucs), conf_range)})")
+        #ax.set_title(f"{title.split('(')[0]} = {title.split('=')[-1]} \n({auc_str(np.mean(aucs), conf_range)})")
+        ax.set_title(f"{title}")
     else:
         ax.set_title(auc_str(np.mean(aucs), conf_range))
 
@@ -114,7 +267,7 @@ def split_preds_into_groups(
     target_label: str,
     true_label: str,
     subgroup_label: str,
-) -> Mapping[str, Tuple[npt.NDArray[np.bool_], npt.NDArray[np.float_]]]:
+) -> Mapping[str, Tuple[npt.NDArray[np.bool_], npt.NDArray[np.float64]]]:
     """Splits predictions into a mapping `subgroup_name -> (y_true, y_pred)."""
     groups = {}
     for subgroup, subgroup_patients in clini_df.PATIENT.groupby(
@@ -130,7 +283,7 @@ def split_preds_into_groups(
 
 def plot_decorated_rocs_for_subtypes(
     ax: plt.Axes,
-    groups: Mapping[str, Tuple[npt.NDArray[np.bool_], npt.NDArray[np.float_]]],
+    groups: Mapping[str, Tuple[npt.NDArray[np.bool_], npt.NDArray[np.float64]]],
     *,
     target_label: str,
     true_label: str,
@@ -174,9 +327,10 @@ def plot_decorated_rocs_for_subtypes(
 def plot_bootstrapped_roc_curve(
     ax: plt.Axes,
     y_true: npt.NDArray[np.bool_],
-    y_score: npt.NDArray[np.float_],
+    y_score: npt.NDArray[np.float64],
     label: Optional[str],
     n_bootstrap_samples: Optional[int] = None,
+    color_index: Optional[int] = 0.8,
     threshold_cmap: Optional[Colormap] = None,
 ):
     """Plots a roc curve with bootstrap interval.
@@ -191,7 +345,13 @@ def plot_bootstrapped_roc_curve(
     """
     assert len(y_true) == len(y_score), "length of truths and scores does not match."
     conf_range = None
+
+    #colormap = cm.devon_r   # blue
+    colormap=cm.acton_r   # pink
+    color = colormap(color_index)
+
     if n_bootstrap_samples:
+        fill = False
         # draw some confidence intervals based on bootstrapping
         # sample repeatedly (with replacement) from our data points,
         # interpolate along the resulting ROC curves
@@ -215,11 +375,13 @@ def plot_bootstrapped_roc_curve(
 
         lower = np.quantile(interp_rocs, 0.025, axis=0)
         upper = np.quantile(interp_rocs, 0.975, axis=0)
-        ax.fill_between(interp_fpr, lower, upper, alpha=0.5)
+        ax.fill_between(interp_fpr, lower, upper,  color=color,  alpha=0.2)
 
         conf_range = (
             np.quantile(bootstrap_aucs, 0.975) - np.quantile(bootstrap_aucs, 0.025)
         ) / 2
+    else:
+        fill = True
 
     fpr, tpr, thresh = roc_curve(y_true, y_score)
     auc = roc_auc_score(y_true, y_score)
@@ -232,19 +394,27 @@ def plot_bootstrapped_roc_curve(
         np.clip(thresh, 0, 1),
         label=label.format(ci=ci_str) if label else "",
         threshold_cmap=threshold_cmap,
+        color_index=color_index,
+        fill=fill,
     )
     return auc, conf_range
 
 
 def plot_curve(
     ax: plt.Axes,
-    x: npt.NDArray[np.float_],
-    y: npt.NDArray[np.float_],
-    thresh: npt.NDArray[np.float_],
+    x: npt.NDArray[np.float64],
+    y: npt.NDArray[np.float64],
+    thresh: npt.NDArray[np.float64],
+    fill = True,
     *,
     label: Optional[str],
     threshold_cmap: Optional[Colormap] = None,
+    color_index: Optional[float] = None,
 ) -> None:
+    #colormap=cm.navia_r #green
+    colormap=cm.acton_r #pinkish
+    #colormap=cm.devon_r  #blue
+    color = colormap(color_index)
     if threshold_cmap is not None:
         points = np.array([x, y]).transpose().reshape(-1, 1, 2)
         segments = np.concatenate([points[:-1], points[1:]], axis=1)
@@ -254,4 +424,7 @@ def plot_curve(
         ax.set_xlim(-0.05, 1.05)
         ax.set_ylim(-0.05, 1.05)
     else:
-        ax.plot(x, y, label=label)
+        ax.plot(x, y, label=label, color=color)
+        if fill:
+            ax.fill_between(x, y, color=color, alpha=0.05)
+
